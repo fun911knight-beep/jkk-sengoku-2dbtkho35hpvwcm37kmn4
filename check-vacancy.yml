@@ -1,0 +1,56 @@
+name: Check JKK vacancy
+
+on:
+  schedule:
+    # 毎時3, 8, 13...分。毎時0分の混雑を避ける。
+    - cron: "3-58/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Androidへテスト通知だけを送る"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jkk-sengoku-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check vacancy or send test
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
+        run: |
+          if [ "$TEST_NOTIFICATION" = "true" ]; then
+            python jkk_watcher.py --test-notification
+          else
+            python jkk_watcher.py
+          fi
+
+      - name: Save changed vacancy state
+        if: ${{ inputs.test_notification != true }}
+        run: |
+          if git diff --quiet -- state.json; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "Update JKK vacancy state [skip ci]"
+          git push
