@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JKKねっとでコーシャハイム千石の募集住戸を監視する。"""
+"""JKKねっとで指定したJKK住宅の募集住戸を監視する。"""
 
 from __future__ import annotations
 
@@ -19,12 +19,19 @@ from html import unescape
 from pathlib import Path
 
 
-PROPERTY_NAME = "コーシャハイム千石"
-PROPERTY_TOKEN = "30B330FC30B730E330CF30A430E030BB30F330B430AF"
 BASE_URL = "https://jhomes.to-kousya.or.jp"
 SEARCH_URL = f"{BASE_URL}/search/jkknet/service/akiyaJyokenDirect"
-PUBLIC_SEARCH_URL = f"{SEARCH_URL}?jutaku_name={PROPERTY_TOKEN}&sen_flg=1"
 DETAIL_URL = f"{BASE_URL}/search/jkknet/service/akiyaSenDet"
+PROPERTIES = [
+    {
+        "name": "コーシャハイム千石",
+        "token": "30B330FC30B730E330CF30A430E030BB30F330B430AF",
+    },
+    {
+        "name": "コーシャハイム田端テラス",
+        "token": "30B330FC30B730E330CF30A430E030BF30D030BF30C630E930B9",
+    },
+]
 STATE_PATH = Path(__file__).with_name("state.json")
 NO_VACANCY_TEXT = "ご希望の住宅、またはご希望の条件の空室はございませんでした"
 USER_AGENT = "Mozilla/5.0 (compatible; personal JKK vacancy checker; +https://github.com/)"
@@ -70,7 +77,11 @@ def new_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
-def extract_summary_rows(page: str) -> list[dict[str, str | int]]:
+def property_url(property_info: dict[str, str]) -> str:
+    return f"{SEARCH_URL}?jutaku_name={property_info['token']}&sen_flg=1"
+
+
+def extract_summary_rows(page: str, property_name: str) -> list[dict[str, str | int]]:
     summaries: list[dict[str, str | int]] = []
     row_blocks = re.findall(
         r'<tr\s+class="ListTXT[12]"[^>]*>(.*?)</tr>', page, flags=re.I | re.S
@@ -80,7 +91,7 @@ def extract_summary_rows(page: str) -> list[dict[str, str | int]]:
         action = re.search(
             r"senPage\('([^']*)','([^']*)','([^']*)','([^']*)'\)", block
         )
-        if len(cells) < 10 or not action or cells[1] != PROPERTY_NAME:
+        if len(cells) < 10 or not action or cells[1] != property_name:
             continue
         count_text = re.sub(r"\D", "", cells[9])
         if not count_text:
@@ -100,7 +111,11 @@ def extract_summary_rows(page: str) -> list[dict[str, str | int]]:
     return summaries
 
 
-def extract_detail_rooms(page: str, summary: dict[str, str | int]) -> list[dict[str, str]]:
+def extract_detail_rooms(
+    page: str,
+    summary: dict[str, str | int],
+    property_info: dict[str, str],
+) -> list[dict[str, str]]:
     rooms: list[dict[str, str]] = []
     row_blocks = re.findall(r'<tr\s+align="center"[^>]*>(.*?)</tr>', page, re.I | re.S)
     for block in row_blocks:
@@ -111,7 +126,8 @@ def extract_detail_rooms(page: str, summary: dict[str, str | int]) -> list[dict[
         room_number = cells[1]
         rooms.append(
             {
-                "key": f"{app_code}:{room_number}",
+                "key": f"{property_info['token']}:{app_code}:{room_number}",
+                "property": property_info["name"],
                 "room": room_number,
                 "layout": cells[4],
                 "direction": cells[5],
@@ -124,7 +140,7 @@ def extract_detail_rooms(page: str, summary: dict[str, str | int]) -> list[dict[
     return rooms
 
 
-def fetch_rooms() -> list[dict[str, str]]:
+def fetch_rooms(property_info: dict[str, str]) -> list[dict[str, str]]:
     opener = new_opener()
     search_page = post(
         opener,
@@ -132,7 +148,7 @@ def fetch_rooms() -> list[dict[str, str]]:
         {
             "redirect": "true",
             "url": SEARCH_URL,
-            "jutaku_name": PROPERTY_TOKEN,
+            "jutaku_name": property_info["token"],
             "sen_flg": "1",
         },
     )
@@ -141,9 +157,9 @@ def fetch_rooms() -> list[dict[str, str]]:
     if "先着順あき家の検索結果" not in search_page:
         raise RuntimeError("JKKねっとの検索結果形式が想定と異なります")
 
-    summaries = extract_summary_rows(search_page)
+    summaries = extract_summary_rows(search_page, property_info["name"])
     if not summaries:
-        raise RuntimeError(f"{PROPERTY_NAME}の募集情報を読み取れませんでした")
+        raise RuntimeError(f"{property_info['name']}の募集情報を読み取れませんでした")
 
     token_match = re.search(
         r"function\s+senPage\b[\s\S]*?xyz\.value\s*=\s*\"([A-F0-9]+)\"",
@@ -166,7 +182,7 @@ def fetch_rooms() -> list[dict[str, str]]:
                 "akiyaRefRM.akiyaDatM.yusenKbn": str(summary["priority_code"]),
             },
         )
-        details = extract_detail_rooms(detail_page, summary)
+        details = extract_detail_rooms(detail_page, summary, property_info)
         if len(details) != int(summary["count"]):
             raise RuntimeError(
                 f"{summary['application_code']}の募集戸数が一致しません "
@@ -200,7 +216,14 @@ def save_state(rooms: list[dict[str, str]]) -> None:
     )
 
 
-def send_ntfy(topic: str, title: str, message: str, *, priority: int = 5) -> None:
+def send_ntfy(
+    topic: str,
+    title: str,
+    message: str,
+    click_url: str,
+    *,
+    priority: int = 5,
+) -> None:
     payload = json.dumps(
         {
             "topic": topic,
@@ -208,7 +231,7 @@ def send_ntfy(topic: str, title: str, message: str, *, priority: int = 5) -> Non
             "message": message,
             "priority": priority,
             "tags": ["house"],
-            "click": PUBLIC_SEARCH_URL,
+            "click": click_url,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -225,8 +248,8 @@ def send_ntfy(topic: str, title: str, message: str, *, priority: int = 5) -> Non
         raise RuntimeError(f"Androidへの通知送信に失敗しました: {exc}") from exc
 
 
-def format_notification(rooms: list[dict[str, str]]) -> str:
-    lines = [f"{PROPERTY_NAME}に新しい募集住戸が出ました。"]
+def format_notification(property_name: str, rooms: list[dict[str, str]]) -> str:
+    lines = [f"{property_name}に新しい募集住戸が出ました。"]
     for room in rooms[:10]:
         lines.append(
             f"・{room['room']}号室 / {room['layout']} / 家賃{room['rent']}円 "
@@ -247,30 +270,67 @@ def run(*, dry_run: bool, test_notification: bool) -> int:
         send_ntfy(
             topic,
             "JKK空室通知（テスト）",
-            "通知設定は正常です。これはコーシャハイム千石のテスト通知です。",
+            "通知設定は正常です。千石と田端テラスを監視します。",
+            property_url(PROPERTIES[0]),
             priority=3,
         )
         print("テスト通知を送信しました")
         return 0
 
-    current_rooms = fetch_rooms()
+    current_rooms: list[dict[str, str]] = []
+    for property_info in PROPERTIES:
+        rooms = fetch_rooms(property_info)
+        current_rooms.extend(rooms)
+        print(f"{property_info['name']}: 募集住戸 {len(rooms)}戸")
+        for room in rooms:
+            print(f"  {room['room']}号室 {room['layout']} {room['rent']}円")
+    current_rooms.sort(key=lambda room: room["key"])
+
     state = load_state()
-    previous_by_key = {room["key"]: room for room in state.get("rooms", [])}
+    previous_by_key: dict[str, dict] = {}
+    for room in state.get("rooms", []):
+        key = room["key"]
+        # 旧版の千石データ（申込区分:部屋番号）を新しいキーへ読み替える。
+        if key.count(":") == 1 and "property" not in room:
+            key = f"{PROPERTIES[0]['token']}:{key}"
+        previous_by_key[key] = room
+
+    comparison_fields = (
+        "room",
+        "layout",
+        "direction",
+        "rent",
+        "fee",
+        "available",
+        "application_code",
+    )
     new_or_changed = [
         room
         for room in current_rooms
-        if room["key"] not in previous_by_key or previous_by_key[room["key"]] != room
+        if room["key"] not in previous_by_key
+        or any(
+            previous_by_key[room["key"]].get(field) != room.get(field)
+            for field in comparison_fields
+        )
     ]
-
-    print(f"{PROPERTY_NAME}: 募集住戸 {len(current_rooms)}戸")
-    for room in current_rooms:
-        print(f"  {room['room']}号室 {room['layout']} {room['rent']}円")
 
     if dry_run:
         return 0
 
     if new_or_changed:
-        send_ntfy(topic, "🏠 JKK空室通知", format_notification(new_or_changed))
+        for property_info in PROPERTIES:
+            property_rooms = [
+                room
+                for room in new_or_changed
+                if room["property"] == property_info["name"]
+            ]
+            if property_rooms:
+                send_ntfy(
+                    topic,
+                    "🏠 JKK空室通知",
+                    format_notification(property_info["name"], property_rooms),
+                    property_url(property_info),
+                )
         print(f"新規・変更 {len(new_or_changed)}戸を通知しました")
 
     if (not state.get("initialized")) or state.get("rooms", []) != current_rooms:
